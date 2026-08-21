@@ -27,8 +27,16 @@
 #include <zmk/events/position_state_changed.h>
 #include <zmk/workqueue.h>
 
+#include <zmk/behavior.h>
+#include <dt-bindings/zmk/rgb.h>
+
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
+#include <zmk/battery.h>
+#endif
+
 #if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 #include <zmk/keymap.h>
+#include <zmk/events/layer_state_changed.h>
 #endif
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -57,6 +65,14 @@ enum rgb_underglow_effect {
     UNDERGLOW_EFFECT_RAINBOW,
     UNDERGLOW_EFFECT_REACT,
     UNDERGLOW_EFFECT_LAYER,
+    UNDERGLOW_EFFECT_KNIGHT,
+    UNDERGLOW_EFFECT_FIRE,
+    UNDERGLOW_EFFECT_CONFETTI,
+    UNDERGLOW_EFFECT_RIPPLE,
+    UNDERGLOW_EFFECT_HEAT,
+    UNDERGLOW_EFFECT_POMODORO,
+    UNDERGLOW_EFFECT_BATTERY,
+    UNDERGLOW_EFFECT_MATRIX,
     UNDERGLOW_EFFECT_NUMBER // Used to track number of underglow effects
 };
 
@@ -204,6 +220,12 @@ static void zmk_rgb_underglow_effect_rainbow(void) {
 static uint8_t react_level[STRIP_NUM_PIXELS];
 static uint16_t react_hue[STRIP_NUM_PIXELS];
 
+static int64_t pomodoro_start;
+
+static int8_t ripple_origin = -1;
+static uint16_t ripple_step;
+static uint8_t heat;
+
 static void zmk_rgb_underglow_effect_react(void) {
     for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
         struct zmk_led_hsb hsb = state.color;
@@ -229,6 +251,11 @@ static int rgb_underglow_react_listener(const zmk_event_t *eh) {
     react_hue[i] = (ev->position * 47) % HUE_MAX;
     react_level[i] = BRT_MAX;
 
+    // the ripple and heat effects ride on the same event
+    ripple_origin = i;
+    ripple_step = 0;
+    heat = heat > 92 ? 100 : heat + 8;
+
     // spill a little onto the neighbours so a keypress reads as a burst
     int l = (i + STRIP_NUM_PIXELS - 1) % STRIP_NUM_PIXELS;
     int r = (i + 1) % STRIP_NUM_PIXELS;
@@ -248,21 +275,277 @@ ZMK_LISTENER(rgb_underglow_react, rgb_underglow_react_listener);
 ZMK_SUBSCRIPTION(rgb_underglow_react, zmk_position_state_changed);
 
 // One hue per active layer, with a gentle gradient along the strip so it does
-// not look flat. The active layer is only known on the central half; the
-// peripheral has no layer state and stays on the base layer colour.
-static void zmk_rgb_underglow_effect_layer(void) {
-#if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-    uint8_t layer = zmk_keymap_highest_layer_active();
-#else
-    uint8_t layer = 0;
-#endif
+// not look flat. Only the central half knows the active layer, so it pushes
+// the hue to the peripherals through the rgb behaviour, whose locality is
+// global; both halves therefore end up on the same colour.
+static uint16_t layer_hue = 0;
 
+int zmk_rgb_underglow_set_layer_hue(uint16_t hue) {
+    layer_hue = hue % HUE_MAX;
+    return 0;
+}
+
+static void zmk_rgb_underglow_effect_layer(void) {
     for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
         struct zmk_led_hsb hsb = state.color;
-        hsb.h = (layer * 72 + i * 6) % HUE_MAX;
+        hsb.h = (layer_hue + i * 6) % HUE_MAX;
         hsb.s = SAT_MAX;
 
         pixels[i] = hsb_to_rgb(hsb_scale_min_max(hsb));
+    }
+}
+
+#if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+static const struct device *rgb_ug_behavior = DEVICE_DT_GET_ANY(zmk_behavior_rgb_underglow);
+
+static int rgb_underglow_layer_listener(const zmk_event_t *eh) {
+    if (rgb_ug_behavior == NULL) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    uint16_t hue = (zmk_keymap_highest_layer_active() * 72) % HUE_MAX;
+
+    // Invoking the behaviour rather than setting the hue directly is what gets
+    // this to the other half: the behaviour is global, so the central relays
+    // it to every peripheral and then runs it locally.
+    struct zmk_behavior_binding binding = {
+        .behavior_dev = rgb_ug_behavior->name,
+        .param1 = RGB_LAYER_CMD,
+        .param2 = hue,
+    };
+    struct zmk_behavior_binding_event event = {
+        .position = 0,
+        .timestamp = k_uptime_get(),
+    };
+
+    zmk_behavior_invoke_binding(&binding, event, true);
+
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(rgb_underglow_layer, rgb_underglow_layer_listener);
+ZMK_SUBSCRIPTION(rgb_underglow_layer, zmk_layer_state_changed);
+#endif
+
+// xorshift, so the sparkly effects do not need an entropy source
+static uint32_t rgb_rand_state = 0x2545f491;
+
+static uint32_t rgb_rand(void) {
+    rgb_rand_state ^= rgb_rand_state << 13;
+    rgb_rand_state ^= rgb_rand_state >> 17;
+    rgb_rand_state ^= rgb_rand_state << 5;
+    return rgb_rand_state;
+}
+
+// Knight Rider: one bright dot bouncing along the strip, trail fading behind.
+static uint8_t knight_level[STRIP_NUM_PIXELS];
+
+static void zmk_rgb_underglow_effect_knight(void) {
+    int span = STRIP_NUM_PIXELS > 1 ? (STRIP_NUM_PIXELS - 1) * 2 : 1;
+    int pos = (state.animation_step / 16) % span;
+    if (pos >= STRIP_NUM_PIXELS) {
+        pos = span - pos;
+    }
+
+    uint8_t fade = 10 + state.animation_speed * 5;
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        knight_level[i] = knight_level[i] > fade ? knight_level[i] - fade : 0;
+    }
+    knight_level[pos] = BRT_MAX;
+
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        hsb.s = SAT_MAX;
+        hsb.b = knight_level[i];
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+    }
+
+    state.animation_step += state.animation_speed * 3;
+    if (state.animation_step > 30000) {
+        state.animation_step = 0;
+    }
+}
+
+// Embers: every LED flickers on its own between deep red and yellow.
+static uint8_t fire_level[STRIP_NUM_PIXELS];
+
+static void zmk_rgb_underglow_effect_fire(void) {
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        int drift = (int)(rgb_rand() % 25) - 12;
+        int level = (int)fire_level[i] + drift;
+
+        if (level < 20) {
+            level = 20 + (int)(rgb_rand() % 25);
+        }
+        if (level > BRT_MAX) {
+            level = BRT_MAX;
+        }
+        fire_level[i] = (uint8_t)level;
+
+        struct zmk_led_hsb hsb = state.color;
+        hsb.h = 5 + fire_level[i] * 45 / BRT_MAX;
+        hsb.s = SAT_MAX;
+        hsb.b = fire_level[i];
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+    }
+}
+
+// Confetti: random LEDs pop in random colours and fade out.
+static uint8_t confetti_level[STRIP_NUM_PIXELS];
+static uint16_t confetti_hue[STRIP_NUM_PIXELS];
+
+static void zmk_rgb_underglow_effect_confetti(void) {
+    if ((rgb_rand() % 10) < 2 + state.animation_speed) {
+        int i = rgb_rand() % STRIP_NUM_PIXELS;
+        confetti_hue[i] = rgb_rand() % HUE_MAX;
+        confetti_level[i] = BRT_MAX;
+    }
+
+    uint8_t fade = 3 + state.animation_speed * 2;
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        hsb.h = confetti_hue[i];
+        hsb.s = SAT_MAX;
+        hsb.b = confetti_level[i];
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+
+        confetti_level[i] = confetti_level[i] > fade ? confetti_level[i] - fade : 0;
+    }
+}
+
+// Ripple: a keypress sends two fronts outwards from the LED it maps to.
+static void zmk_rgb_underglow_effect_ripple(void) {
+    struct zmk_led_hsb off = state.color;
+    off.b = 0;
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        pixels[i] = hsb_to_rgb(off);
+    }
+
+    if (ripple_origin < 0) {
+        return;
+    }
+
+    int radius = ripple_step / 10;
+    int brightness = BRT_MAX - ripple_step * BRT_MAX / (10 * STRIP_NUM_PIXELS);
+
+    if (brightness <= 0 || radius >= STRIP_NUM_PIXELS) {
+        ripple_origin = -1;
+        return;
+    }
+
+    for (int d = -radius; d <= radius; d += (radius == 0 ? 1 : 2 * radius)) {
+        int i = ripple_origin + d;
+        if (i < 0 || i >= STRIP_NUM_PIXELS) {
+            continue;
+        }
+
+        struct zmk_led_hsb hsb = state.color;
+        hsb.h = (state.color.h + radius * 25) % HUE_MAX;
+        hsb.s = SAT_MAX;
+        hsb.b = brightness;
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+    }
+
+    ripple_step += 2 + state.animation_speed;
+}
+
+// Typing heat: idle is a calm blue, the strip climbs through green and amber
+// to red as you type faster. Each half warms up with its own hand.
+static void zmk_rgb_underglow_effect_heat(void) {
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        hsb.h = (220 - heat * 220 / 100 + i * 5) % HUE_MAX;
+        hsb.s = SAT_MAX;
+        hsb.b = 20 + heat * 80 / 100;
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+    }
+
+    if (heat > 0) {
+        heat--;
+    }
+}
+
+// Pomodoro: the strip fills up over 25 minutes and drifts from green to red,
+// then flashes when the session is over. Selecting the effect starts it, and
+// since selecting is a global behaviour both halves start together.
+#define POMODORO_MS (25 * 60 * 1000)
+
+static void zmk_rgb_underglow_effect_pomodoro(void) {
+    int64_t elapsed = k_uptime_get() - pomodoro_start;
+
+    if (elapsed >= POMODORO_MS) {
+        bool lit = ((elapsed / 400) % 2) == 0;
+        for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+            struct zmk_led_hsb hsb = state.color;
+            hsb.h = 0;
+            hsb.s = SAT_MAX;
+            hsb.b = lit ? BRT_MAX : 0;
+
+            pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+        }
+        return;
+    }
+
+    int filled = (int)(elapsed * STRIP_NUM_PIXELS / POMODORO_MS);
+    int hue = 120 - (int)(elapsed * 120 / POMODORO_MS);
+
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        hsb.h = hue;
+        hsb.s = SAT_MAX;
+        hsb.b = i <= filled ? BRT_MAX : 8;
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+    }
+}
+
+// Battery gauge: lit LEDs are the charge of the half you are looking at, and
+// the colour walks from red to green with it.
+static void zmk_rgb_underglow_effect_battery(void) {
+#if IS_ENABLED(CONFIG_ZMK_BATTERY_REPORTING)
+    uint8_t level = zmk_battery_state_of_charge();
+#else
+    uint8_t level = 100;
+#endif
+
+    int lit = (level * STRIP_NUM_PIXELS + 50) / 100;
+
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        hsb.h = level * 120 / 100;
+        hsb.s = SAT_MAX;
+        hsb.b = i < lit ? BRT_MAX : 0;
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+    }
+}
+
+// Digital rain: green drops light up at random and trail off.
+static uint8_t matrix_level[STRIP_NUM_PIXELS];
+
+static void zmk_rgb_underglow_effect_matrix(void) {
+    if ((rgb_rand() % 10) < 3) {
+        int i = rgb_rand() % STRIP_NUM_PIXELS;
+        if (matrix_level[i] < 40) {
+            matrix_level[i] = BRT_MAX;
+        }
+    }
+
+    uint8_t fade = 2 + state.animation_speed;
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        hsb.h = 120;
+        hsb.s = SAT_MAX;
+        hsb.b = matrix_level[i];
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+
+        matrix_level[i] = matrix_level[i] > fade ? matrix_level[i] - fade : 0;
     }
 }
 
@@ -288,6 +571,30 @@ static void zmk_rgb_underglow_tick(struct k_work *work) {
         break;
     case UNDERGLOW_EFFECT_LAYER:
         zmk_rgb_underglow_effect_layer();
+        break;
+    case UNDERGLOW_EFFECT_KNIGHT:
+        zmk_rgb_underglow_effect_knight();
+        break;
+    case UNDERGLOW_EFFECT_FIRE:
+        zmk_rgb_underglow_effect_fire();
+        break;
+    case UNDERGLOW_EFFECT_CONFETTI:
+        zmk_rgb_underglow_effect_confetti();
+        break;
+    case UNDERGLOW_EFFECT_RIPPLE:
+        zmk_rgb_underglow_effect_ripple();
+        break;
+    case UNDERGLOW_EFFECT_HEAT:
+        zmk_rgb_underglow_effect_heat();
+        break;
+    case UNDERGLOW_EFFECT_POMODORO:
+        zmk_rgb_underglow_effect_pomodoro();
+        break;
+    case UNDERGLOW_EFFECT_BATTERY:
+        zmk_rgb_underglow_effect_battery();
+        break;
+    case UNDERGLOW_EFFECT_MATRIX:
+        zmk_rgb_underglow_effect_matrix();
         break;
     }
 
@@ -462,6 +769,10 @@ int zmk_rgb_underglow_select_effect(int effect) {
 
     state.current_effect = effect;
     state.animation_step = 0;
+
+    if (effect == UNDERGLOW_EFFECT_POMODORO) {
+        pomodoro_start = k_uptime_get();
+    }
 
     return zmk_rgb_underglow_save_state();
 }

@@ -27,3 +27,6 @@ int zmk_rgb_underglow_change_sat(int direction);
 int zmk_rgb_underglow_change_brt(int direction);
 int zmk_rgb_underglow_change_spd(int direction);
 int zmk_rgb_underglow_set_hsb(struct zmk_led_hsb color);
+// Transient hue used by the per-layer effect. Not persisted: the central
+// pushes it to the peripherals on every layer change.
+int zmk_rgb_underglow_set_layer_hue(uint16_t hue);

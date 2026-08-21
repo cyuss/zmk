@@ -19,6 +19,7 @@
 #define RGB_EFR_CMD 12
 #define RGB_EFS_CMD 13
 #define RGB_COLOR_HSB_CMD 14
+#define RGB_LAYER_CMD 15
 
 #define RGB_TOG RGB_TOG_CMD 0
 #define RGB_ON RGB_ON_CMD 0
