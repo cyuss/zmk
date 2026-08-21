@@ -24,7 +24,12 @@
 #include <zmk/event_manager.h>
 #include <zmk/events/activity_state_changed.h>
 #include <zmk/events/usb_conn_state_changed.h>
+#include <zmk/events/position_state_changed.h>
 #include <zmk/workqueue.h>
+
+#if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+#include <zmk/keymap.h>
+#endif
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -49,6 +54,9 @@ enum rgb_underglow_effect {
     UNDERGLOW_EFFECT_BREATHE,
     UNDERGLOW_EFFECT_SPECTRUM,
     UNDERGLOW_EFFECT_SWIRL,
+    UNDERGLOW_EFFECT_RAINBOW,
+    UNDERGLOW_EFFECT_REACT,
+    UNDERGLOW_EFFECT_LAYER,
     UNDERGLOW_EFFECT_NUMBER // Used to track number of underglow effects
 };
 
@@ -175,6 +183,89 @@ static void zmk_rgb_underglow_effect_swirl(void) {
     state.animation_step = state.animation_step % HUE_MAX;
 }
 
+// Full colour wheel spread twice over the strip, so two neighbouring LEDs are
+// always far apart on the wheel, scrolling fast. Saturation is pinned to the
+// maximum: this effect is meant to be loud whatever the stored colour is.
+static void zmk_rgb_underglow_effect_rainbow(void) {
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        hsb.h = (HUE_MAX * 2 / STRIP_NUM_PIXELS * i + state.animation_step) % HUE_MAX;
+        hsb.s = SAT_MAX;
+
+        pixels[i] = hsb_to_rgb(hsb_scale_min_max(hsb));
+    }
+
+    state.animation_step += state.animation_speed * 4;
+    state.animation_step = state.animation_step % HUE_MAX;
+}
+
+// Keypress reactive: every key lights one LED in its own colour and fades out.
+// Both halves react to the keys of the half they are on.
+static uint8_t react_level[STRIP_NUM_PIXELS];
+static uint16_t react_hue[STRIP_NUM_PIXELS];
+
+static void zmk_rgb_underglow_effect_react(void) {
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        hsb.h = react_hue[i];
+        hsb.s = SAT_MAX;
+        hsb.b = react_level[i];
+
+        pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
+
+        uint8_t fade = 2 + state.animation_speed * 2;
+        react_level[i] = react_level[i] > fade ? react_level[i] - fade : 0;
+    }
+}
+
+static int rgb_underglow_react_listener(const zmk_event_t *eh) {
+    const struct zmk_position_state_changed *ev = as_zmk_position_state_changed(eh);
+
+    if (ev == NULL || !ev->state) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    int i = ev->position % STRIP_NUM_PIXELS;
+    react_hue[i] = (ev->position * 47) % HUE_MAX;
+    react_level[i] = BRT_MAX;
+
+    // spill a little onto the neighbours so a keypress reads as a burst
+    int l = (i + STRIP_NUM_PIXELS - 1) % STRIP_NUM_PIXELS;
+    int r = (i + 1) % STRIP_NUM_PIXELS;
+    if (react_level[l] < BRT_MAX / 2) {
+        react_hue[l] = react_hue[i];
+        react_level[l] = BRT_MAX / 2;
+    }
+    if (react_level[r] < BRT_MAX / 2) {
+        react_hue[r] = react_hue[i];
+        react_level[r] = BRT_MAX / 2;
+    }
+
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(rgb_underglow_react, rgb_underglow_react_listener);
+ZMK_SUBSCRIPTION(rgb_underglow_react, zmk_position_state_changed);
+
+// One hue per active layer, with a gentle gradient along the strip so it does
+// not look flat. The active layer is only known on the central half; the
+// peripheral has no layer state and stays on the base layer colour.
+static void zmk_rgb_underglow_effect_layer(void) {
+#if !IS_ENABLED(CONFIG_ZMK_SPLIT) || IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    uint8_t layer = zmk_keymap_highest_layer_active();
+#else
+    uint8_t layer = 0;
+#endif
+
+    for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+        struct zmk_led_hsb hsb = state.color;
+        hsb.h = (layer * 72 + i * 6) % HUE_MAX;
+        hsb.s = SAT_MAX;
+
+        pixels[i] = hsb_to_rgb(hsb_scale_min_max(hsb));
+    }
+}
+
 static void zmk_rgb_underglow_tick(struct k_work *work) {
     switch (state.current_effect) {
     case UNDERGLOW_EFFECT_SOLID:
@@ -188,6 +279,15 @@ static void zmk_rgb_underglow_tick(struct k_work *work) {
         break;
     case UNDERGLOW_EFFECT_SWIRL:
         zmk_rgb_underglow_effect_swirl();
+        break;
+    case UNDERGLOW_EFFECT_RAINBOW:
+        zmk_rgb_underglow_effect_rainbow();
+        break;
+    case UNDERGLOW_EFFECT_REACT:
+        zmk_rgb_underglow_effect_react();
+        break;
+    case UNDERGLOW_EFFECT_LAYER:
+        zmk_rgb_underglow_effect_layer();
         break;
     }
 
