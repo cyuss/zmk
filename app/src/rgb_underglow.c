@@ -84,6 +84,11 @@ struct rgb_underglow_state {
     bool on;
 };
 
+// Hue pushed by the central on every layer change, and whether the
+// single-colour effects should follow it instead of the stored colour.
+static uint16_t layer_hue = CONFIG_ZMK_RGB_UNDERGLOW_HUE_START;
+static bool layer_tint;
+
 static const struct device *led_strip;
 
 static struct led_rgb pixels[STRIP_NUM_PIXELS];
@@ -93,6 +98,25 @@ static struct rgb_underglow_state state;
 #if IS_ENABLED(CONFIG_ZMK_RGB_UNDERGLOW_EXT_POWER)
 static const struct device *const ext_power = DEVICE_DT_GET(DT_INST(0, zmk_ext_power_generic));
 #endif
+
+int zmk_rgb_underglow_save_state(void);
+
+// Starting colour of every effect that only uses one: the stored colour, or
+// the same colour wearing the active layer's hue.
+static struct zmk_led_hsb base_color(void) {
+    struct zmk_led_hsb hsb = state.color;
+
+    if (layer_tint) {
+        hsb.h = layer_hue;
+    }
+
+    return hsb;
+}
+
+int zmk_rgb_underglow_set_layer_tint(int mode) {
+    layer_tint = (mode == 0 || mode == 1) ? mode : !layer_tint;
+    return zmk_rgb_underglow_save_state();
+}
 
 static struct zmk_led_hsb hsb_scale_min_max(struct zmk_led_hsb hsb) {
     hsb.b = CONFIG_ZMK_RGB_UNDERGLOW_BRT_MIN +
@@ -156,13 +180,13 @@ static struct led_rgb hsb_to_rgb(struct zmk_led_hsb hsb) {
 
 static void zmk_rgb_underglow_effect_solid(void) {
     for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
-        pixels[i] = hsb_to_rgb(hsb_scale_min_max(state.color));
+        pixels[i] = hsb_to_rgb(hsb_scale_min_max(base_color()));
     }
 }
 
 static void zmk_rgb_underglow_effect_breathe(void) {
     for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
-        struct zmk_led_hsb hsb = state.color;
+        struct zmk_led_hsb hsb = base_color();
         hsb.b = abs(state.animation_step - 1200) / 12;
 
         pixels[i] = hsb_to_rgb(hsb_scale_zero_max(hsb));
@@ -278,8 +302,6 @@ ZMK_SUBSCRIPTION(rgb_underglow_react, zmk_position_state_changed);
 // not look flat. Only the central half knows the active layer, so it pushes
 // the hue to the peripherals through the rgb behaviour, whose locality is
 // global; both halves therefore end up on the same colour.
-static uint16_t layer_hue = 0;
-
 int zmk_rgb_underglow_set_layer_hue(uint16_t hue) {
     layer_hue = hue % HUE_MAX;
     return 0;
@@ -354,7 +376,7 @@ static void zmk_rgb_underglow_effect_knight(void) {
     knight_level[pos] = BRT_MAX;
 
     for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
-        struct zmk_led_hsb hsb = state.color;
+        struct zmk_led_hsb hsb = base_color();
         hsb.s = SAT_MAX;
         hsb.b = knight_level[i];
 
@@ -418,7 +440,7 @@ static void zmk_rgb_underglow_effect_confetti(void) {
 
 // Ripple: a keypress sends two fronts outwards from the LED it maps to.
 static void zmk_rgb_underglow_effect_ripple(void) {
-    struct zmk_led_hsb off = state.color;
+    struct zmk_led_hsb off = base_color();
     off.b = 0;
     for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
         pixels[i] = hsb_to_rgb(off);
@@ -442,8 +464,8 @@ static void zmk_rgb_underglow_effect_ripple(void) {
             continue;
         }
 
-        struct zmk_led_hsb hsb = state.color;
-        hsb.h = (state.color.h + radius * 25) % HUE_MAX;
+        struct zmk_led_hsb hsb = base_color();
+        hsb.h = (hsb.h + radius * 25) % HUE_MAX;
         hsb.s = SAT_MAX;
         hsb.b = brightness;
 
@@ -638,6 +660,16 @@ static int rgb_settings_set(const char *name, size_t len, settings_read_cb read_
         return rc;
     }
 
+    if (settings_name_steq(name, "tint", &next) && !next) {
+        if (len != sizeof(layer_tint)) {
+            return -EINVAL;
+        }
+
+        rc = read_cb(cb_arg, &layer_tint, sizeof(layer_tint));
+
+        return rc >= 0 ? 0 : rc;
+    }
+
     return -ENOENT;
 }
 
@@ -645,6 +677,7 @@ SETTINGS_STATIC_HANDLER_DEFINE(rgb_underglow, "rgb/underglow", NULL, rgb_setting
 
 static void zmk_rgb_underglow_save_state_work(struct k_work *_work) {
     settings_save_one("rgb/underglow/state", &state, sizeof(state));
+    settings_save_one("rgb/underglow/tint", &layer_tint, sizeof(layer_tint));
 }
 
 static struct k_work_delayable underglow_save_work;

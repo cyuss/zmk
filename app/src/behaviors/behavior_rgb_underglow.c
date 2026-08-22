@@ -238,6 +238,8 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
         return zmk_rgb_underglow_cycle_effect(1);
     case RGB_EFR_CMD:
         return zmk_rgb_underglow_cycle_effect(-1);
+    case RGB_TINT_CMD:
+        return zmk_rgb_underglow_set_layer_tint(binding->param2);
     case RGB_LAYER_CMD:
         return zmk_rgb_underglow_set_layer_hue(binding->param2);
     case RGB_COLOR_HSB_CMD:

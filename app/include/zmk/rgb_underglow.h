@@ -30,3 +30,6 @@ int zmk_rgb_underglow_set_hsb(struct zmk_led_hsb color);
 // Transient hue used by the per-layer effect. Not persisted: the central
 // pushes it to the peripherals on every layer change.
 int zmk_rgb_underglow_set_layer_hue(uint16_t hue);
+// Take the hue of the single-colour effects from the active layer instead of
+// the stored colour. 0 off, 1 on, anything else toggles.
+int zmk_rgb_underglow_set_layer_tint(int mode);
